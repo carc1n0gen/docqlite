@@ -1,0 +1,21 @@
+{
+  "name": "docqlite",
+  "version": "1.0.0",
+  "description": "SQLite3 wrapper with a MongoDB-like document API",
+  "license": "MIT",
+  "author": "Carson Evans <carsonwevans@gmail.com>",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

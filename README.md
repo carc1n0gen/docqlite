@@ -6,6 +6,8 @@ DocQLite is synchronous and dependency-free. It uses Node.js' built-in [`node:sq
 
 ## Installation
 
+(not published yet)
+
 ```sh
 npm install docqlite
 ```

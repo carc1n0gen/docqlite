@@ -1,6 +1,6 @@
 {
   "name": "docqlite",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "SQLite3 wrapper with a MongoDB-like document API",
   "license": "MIT",
   "author": "Carson Evans <carsonwevans@gmail.com>",

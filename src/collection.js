@@ -81,6 +81,14 @@ export class Collection {
     return this.#update(query, update, { upsert: options.upsert });
   }
 
+  deleteOne(query = {}) {
+    return this.#delete(query, { limit: 1 });
+  }
+
+  deleteMany(query = {}) {
+    return this.#delete(query);
+  }
+
   countDocuments(query = {}) {
     assertPlainObject(query, "countDocuments query");
 
@@ -178,6 +186,27 @@ export class Collection {
     });
 
     return runUpdate();
+  }
+
+  #delete(query, options = {}) {
+    assertPlainObject(query, "delete query");
+
+    const selectQuery = compileSelectSql(
+      this.tableName,
+      query,
+      { limit: options.limit },
+      "_id",
+    );
+    const result = this.database
+      .prepare(
+        `DELETE FROM ${this.tableName} WHERE _id IN (${selectQuery.sql})`,
+      )
+      .run(...selectQuery.params);
+
+    return {
+      acknowledged: true,
+      deletedCount: Number(result.changes),
+    };
   }
 
   #createTable() {

@@ -21,7 +21,10 @@ const Characters = db.collection("characters");
 Characters.insertOne({
   name: "SpongeBob SquarePants",
   job: "fry cook",
-  tags: ["krusty-krab", "jellyfisher"],
+  hobbies: ["jellyfishing"],
+  badges: ["employee of the month"],
+  jellyfishCaught: 42,
+  address: { city: "Bikini Bottom", street: "124 Conch Street" },
 });
 
 const fryCooks = Characters.find({ job: "fry cook" });
@@ -31,60 +34,62 @@ console.log(fryCooks);
 db.close();
 ```
 
-## Insert documents
+## Insert a document
 
 ```js
 const result = Characters.insertOne({
   name: "Patrick Star",
-  home: "under a rock",
+  job: "professional best friend",
+  hobbies: ["jellyfishing", "napping"],
+  badges: ["goober"],
+  jellyfishCaught: 15,
+  address: { city: "Bikini Bottom", street: "120 Conch Street" },
 });
 
 console.log(result.insertedId);
 ```
 
-If a document does not include `_id`, DocQLite generates a 24-character time-sortable hex string inspired by MongoDB ObjectId. The generated value is stored as a plain string.
-
-You may also provide a custom MongoDB-style `_id` value, such as a string, number, boolean, `null`, or object:
+If a document does not include `_id`, DocQLite generates a 24-character time-sortable hex string inspired by MongoDB ObjectId. The generated value is stored as a plain string. A custom `_id` value must be a string, number, boolean, `null`, or object:
 
 ```js
 Characters.insertOne({
-  _id: "spongebob",
-  name: "SpongeBob SquarePants",
+  _id: "squidward",
+  name: "Squidward Tentacles",
+  job: "cashier",
+  hobbies: ["clarinet", "painting"],
+  badges: ["grumpy", "optimist"],
+  jellyfishCaught: 0,
+  address: { city: "Bikini Bottom", street: "122 Conch Street" },
 });
 ```
 
-Custom `_id` values cannot be arrays, regular expressions, `undefined`, functions, symbols, non-finite numbers, or objects with keys that start with `$`.
+Insert many documents:
 
 ```js
 Characters.insertMany([
   {
     name: "SpongeBob SquarePants",
-    email: "spongebob@krustykrab.example",
     job: "fry cook",
-    location: "Krusty Krab",
-    onShift: true,
+    hobbies: ["jellyfishing"],
+    badges: ["employee of the month"],
     jellyfishCaught: 42,
-    krabbyPattiesMade: 100,
-    tags: ["krusty-krab", "jellyfisher"],
-    address: { city: "Bikini Bottom" },
+    address: { city: "Bikini Bottom", street: "124 Conch Street" },
   },
   {
     name: "Patrick Star",
     job: "professional best friend",
-    location: "Bikini Bottom",
-    onShift: false,
-    jellyfishCaught: 5,
-    tags: ["jellyfisher"],
-    address: { city: "Bikini Bottom" },
+    hobbies: ["jellyfishing", "napping"],
+    badges: ["goober"],
+    jellyfishCaught: 15,
+    address: { city: "Bikini Bottom", street: "120 Conch Street" },
   },
   {
     name: "Squidward Tentacles",
     job: "cashier",
-    location: "Krusty Krab",
-    onShift: true,
+    hobbies: ["clarinet", "painting"],
+    badges: ["grumpy", "optimist"],
     jellyfishCaught: 0,
-    tags: ["krusty-krab", "happy"],
-    address: { city: "Bikini Bottom" },
+    address: { city: "Bikini Bottom", street: "122 Conch Street" },
   },
 ]);
 ```
@@ -123,7 +128,7 @@ Sorting and pagination:
 
 ```js
 Characters.find(
-  { onShift: true },
+  {},
   {
     sort: { jellyfishCaught: -1 },
     limit: 10,
@@ -168,8 +173,8 @@ $nor
 Characters.updateOne(
   { name: "SpongeBob SquarePants" },
   {
-    $set: { onShift: true },
-    $inc: { krabbyPattiesMade: 1 },
+    $set: { hasBoatLicense: false },
+    $inc: { jellyfishCaught: 1 },
   },
 );
 ```
@@ -178,9 +183,9 @@ Update many documents:
 
 ```js
 Characters.updateMany(
-  { location: "Krusty Krab" },
+  { $gt: { jellyfishCaught: 40 } },
   {
-    $addToSet: { tags: "krusty-krab" },
+    $addToSet: { badges: "professional jellyfisher" },
   },
 );
 ```
@@ -191,14 +196,14 @@ Array updates:
 Characters.updateOne(
   { name: "SpongeBob SquarePants" },
   {
-    $push: { tags: "bubble-blower" },
+    $push: { hobbies: "blowing bubbles" },
   },
 );
 
 Characters.updateOne(
   { name: "Squidward Tentacles" },
   {
-    $pull: { tags: "happy" },
+    $pull: { badges: "optimist" },
   },
 );
 ```
@@ -207,9 +212,9 @@ Upsert:
 
 ```js
 Characters.updateOne(
-  { email: "spongebob@krustykrab.example" },
+  { name: "Plankton" },
   {
-    $set: { name: "SpongeBob SquarePants", onShift: true },
+    $set: { name: "Plankton" },
     $setOnInsert: { createdAt: new Date().toISOString() },
   },
   { upsert: true },
@@ -227,6 +232,24 @@ $pull
 $addToSet
 $setOnInsert
 ```
+
+## Delete documents
+
+Delete the first matching document:
+
+```js
+Characters.deleteOne({ name: "Plankton" });
+```
+
+Delete every matching document:
+
+```js
+const result = Characters.deleteMany({ onShift: false });
+
+console.log(result.deletedCount);
+```
+
+Both methods accept the same query filters as `find`. Calling `deleteMany()` with no filter deletes every document in the collection.
 
 ## Notes
 

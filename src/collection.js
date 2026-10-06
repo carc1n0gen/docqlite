@@ -73,6 +73,36 @@ export class Collection {
     return this.find(query, { ...options, limit: 1 })[0] ?? null;
   }
 
+  lookup(query = {}, options = {}) {
+    assertPlainObject(query, "lookup query");
+
+    const lookupOptions = normalizeLookupOptions(options, this.database);
+    const compiledQuery = compileQuery(query, "parent.document");
+    const join = compileJsonFieldEquality(
+      "parent.document",
+      lookupOptions.localField,
+      "child.document",
+      lookupOptions.foreignField,
+    );
+    let sql = `
+      SELECT
+        parent._id AS parent_id,
+        parent.document AS parent_document,
+        child.document AS child_document
+      FROM ${this.tableName} AS parent
+      LEFT JOIN ${lookupOptions.from.tableName} AS child ON ${join.sql}
+    `;
+    const params = [...join.params];
+
+    if (compiledQuery.sql) {
+      sql += ` WHERE ${compiledQuery.sql}`;
+      params.push(...compiledQuery.params);
+    }
+
+    const rows = this.database.prepare(sql).all(...params);
+    return hydrateLookupRows(rows, lookupOptions.as);
+  }
+
   updateOne(query, update, options = {}) {
     return this.#update(query, update, { upsert: options.upsert, limit: 1 });
   }
@@ -195,8 +225,9 @@ function compileSelectSql(
   query,
   options = {},
   columns = "document",
+  documentSql = "document",
 ) {
-  const compiledQuery = compileQuery(query);
+  const compiledQuery = compileQuery(query, documentSql);
   let sql = `SELECT ${columns} FROM ${tableName}`;
   const params = [...compiledQuery.params];
 
@@ -205,7 +236,7 @@ function compileSelectSql(
   }
 
   if (options.sort) {
-    const compiledSort = compileSort(options.sort);
+    const compiledSort = compileSort(options.sort, documentSql);
     sql += ` ORDER BY ${compiledSort.sql}`;
     params.push(...compiledSort.params);
   }
@@ -225,6 +256,96 @@ function compileSelectSql(
   }
 
   return { sql, params };
+}
+
+function normalizeLookupOptions(options, database) {
+  assertPlainObject(options, "lookup options");
+
+  const { from, localField, foreignField, as } = options;
+
+  if (!(from instanceof Collection)) {
+    throw new TypeError("lookup from must be a DocQLite collection");
+  }
+
+  if (from.database !== database) {
+    throw new Error("lookup from collection must use the same database");
+  }
+
+  assertFieldPath(localField);
+  assertFieldPath(foreignField);
+  assertFieldPath(as);
+
+  return { from, localField, foreignField, as };
+}
+
+function compileJsonFieldEquality(
+  leftDocumentSql,
+  leftPath,
+  rightDocumentSql,
+  rightPath,
+) {
+  const leftJsonPath = toJsonPath(leftPath);
+  const rightJsonPath = toJsonPath(rightPath);
+  const leftType = `json_type(${leftDocumentSql}, ?)`;
+  const rightType = `json_type(${rightDocumentSql}, ?)`;
+  const leftValue = `json_extract(${leftDocumentSql}, ?)`;
+  const rightValue = `json_extract(${rightDocumentSql}, ?)`;
+
+  return {
+    sql: `(
+      CASE
+        WHEN ${leftType} IN ('null', 'true', 'false')
+          THEN ${leftType} = ${rightType}
+        WHEN ${leftType} IN ('integer', 'real')
+          THEN ${rightType} IN ('integer', 'real') AND ${leftValue} = ${rightValue}
+        WHEN ${leftType} = 'text'
+          THEN ${rightType} = 'text' AND ${leftValue} = ${rightValue}
+        WHEN ${leftType} IN ('array', 'object')
+          THEN ${leftType} = ${rightType} AND json(${leftValue}) = json(${rightValue})
+        ELSE 0
+      END
+    )`,
+    params: [
+      leftJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+      leftJsonPath,
+      rightJsonPath,
+    ],
+  };
+}
+
+function hydrateLookupRows(rows, as) {
+  const documents = [];
+  const documentsById = new Map();
+
+  for (const row of rows) {
+    let document = documentsById.get(row.parent_id);
+
+    if (!document) {
+      document = JSON.parse(row.parent_document);
+      setByPath(document, as, []);
+      documentsById.set(row.parent_id, document);
+      documents.push(document);
+    }
+
+    if (row.child_document !== null) {
+      getByPath(document, as).value.push(JSON.parse(row.child_document));
+    }
+  }
+
+  return documents;
 }
 
 function assertUpdateDocument(update) {
@@ -600,14 +721,14 @@ function deepEqual(left, right) {
   return false;
 }
 
-function compileQuery(query) {
+function compileQuery(query, documentSql = "document") {
   assertPlainObject(query, "query");
 
   const fragments = [];
   const params = [];
 
   for (const [key, condition] of Object.entries(query)) {
-    const fragment = compileQueryEntry(key, condition);
+    const fragment = compileQueryEntry(key, condition, documentSql);
     fragments.push(fragment.sql);
     params.push(...fragment.params);
   }
@@ -618,34 +739,36 @@ function compileQuery(query) {
   };
 }
 
-function compileQueryEntry(key, condition) {
+function compileQueryEntry(key, condition, documentSql) {
   if (key === "$and") {
-    return compileLogicalQuery("$and", condition, "AND", false);
+    return compileLogicalQuery("$and", condition, "AND", false, documentSql);
   }
 
   if (key === "$or") {
-    return compileLogicalQuery("$or", condition, "OR", false);
+    return compileLogicalQuery("$or", condition, "OR", false, documentSql);
   }
 
   if (key === "$nor") {
-    return compileLogicalQuery("$nor", condition, "OR", true);
+    return compileLogicalQuery("$nor", condition, "OR", true, documentSql);
   }
 
   if (key.startsWith("$")) {
     throw new Error(`Unsupported query operator: ${key}`);
   }
 
-  return compileFieldCondition(key, condition);
+  return compileFieldCondition(key, condition, documentSql);
 }
 
-function compileLogicalQuery(operator, condition, joiner, negate) {
+function compileLogicalQuery(operator, condition, joiner, negate, documentSql) {
   assertQueryArray(condition, operator);
 
   if (condition.length === 0) {
     return { sql: negate ? "1 = 1" : "1 = 0", params: [] };
   }
 
-  const fragments = condition.map((childQuery) => compileQuery(childQuery));
+  const fragments = condition.map((childQuery) =>
+    compileQuery(childQuery, documentSql),
+  );
   const sql = fragments
     .map((fragment) => `(${fragment.sql || "1 = 1"})`)
     .join(` ${joiner} `);
@@ -657,9 +780,9 @@ function compileLogicalQuery(operator, condition, joiner, negate) {
   };
 }
 
-function compileFieldCondition(path, condition) {
+function compileFieldCondition(path, condition, documentSql) {
   if (!isOperatorObject(condition)) {
-    return compileEquality(path, condition);
+    return compileEquality(path, condition, documentSql);
   }
 
   const fragments = [];
@@ -670,7 +793,13 @@ function compileFieldCondition(path, condition) {
       continue;
     }
 
-    const fragment = compileFieldOperator(path, operator, expected, condition);
+    const fragment = compileFieldOperator(
+      path,
+      operator,
+      expected,
+      condition,
+      documentSql,
+    );
     fragments.push(fragment.sql);
     params.push(...fragment.params);
   }
@@ -685,45 +814,51 @@ function compileFieldCondition(path, condition) {
   };
 }
 
-function compileFieldOperator(path, operator, expected, condition) {
+function compileFieldOperator(
+  path,
+  operator,
+  expected,
+  condition,
+  documentSql,
+) {
   switch (operator) {
     case "$eq":
-      return compileEquality(path, expected);
+      return compileEquality(path, expected, documentSql);
     case "$ne": {
-      const equality = compileEquality(path, expected);
+      const equality = compileEquality(path, expected, documentSql);
       return {
         sql: `NOT (${equality.sql})`,
         params: equality.params,
       };
     }
     case "$gt":
-      return compileComparison(path, ">", expected);
+      return compileComparison(path, ">", expected, documentSql);
     case "$gte":
-      return compileComparison(path, ">=", expected);
+      return compileComparison(path, ">=", expected, documentSql);
     case "$lt":
-      return compileComparison(path, "<", expected);
+      return compileComparison(path, "<", expected, documentSql);
     case "$lte":
-      return compileComparison(path, "<=", expected);
+      return compileComparison(path, "<=", expected, documentSql);
     case "$in":
-      return compileIn(path, expected, false);
+      return compileIn(path, expected, false, documentSql);
     case "$nin":
-      return compileIn(path, expected, true);
+      return compileIn(path, expected, true, documentSql);
     case "$exists":
-      return compileExists(path, expected);
+      return compileExists(path, expected, documentSql);
     case "$regex":
-      return compileRegex(path, expected, condition.$options);
+      return compileRegex(path, expected, condition.$options, documentSql);
     default:
       throw new Error(`Unsupported query operator: ${operator}`);
   }
 }
 
-function compileEquality(path, expected) {
+function compileEquality(path, expected, documentSql) {
   assertJsonComparable(expected, "equality value");
 
   const jsonPath = toJsonPath(path);
   const exact = compileJsonValueComparison(
-    "json_extract(document, ?)",
-    "json_type(document, ?)",
+    `json_extract(${documentSql}, ?)`,
+    `json_type(${documentSql}, ?)`,
     [jsonPath, jsonPath],
     expected,
   );
@@ -732,7 +867,7 @@ function compileEquality(path, expected) {
     return exact;
   }
 
-  const contains = compileArrayContains(jsonPath, expected);
+  const contains = compileArrayContains(jsonPath, expected, documentSql);
 
   return {
     sql: `((${exact.sql}) OR (${contains.sql}))`,
@@ -740,7 +875,7 @@ function compileEquality(path, expected) {
   };
 }
 
-function compileComparison(path, operator, expected) {
+function compileComparison(path, operator, expected, documentSql) {
   if (!isComparableScalar(expected)) {
     throw new TypeError(
       `${operator} expects a string, number, boolean, or null`,
@@ -750,12 +885,12 @@ function compileComparison(path, operator, expected) {
   const jsonPath = toJsonPath(path);
 
   return {
-    sql: `(json_type(document, ?) IS NOT NULL AND json_extract(document, ?) ${operator} ?)`,
+    sql: `(json_type(${documentSql}, ?) IS NOT NULL AND json_extract(${documentSql}, ?) ${operator} ?)`,
     params: [jsonPath, jsonPath, expected],
   };
 }
 
-function compileIn(path, expected, negate) {
+function compileIn(path, expected, negate, documentSql) {
   if (!Array.isArray(expected)) {
     throw new TypeError(`${negate ? "$nin" : "$in"} expects an array`);
   }
@@ -764,7 +899,9 @@ function compileIn(path, expected, negate) {
     return { sql: negate ? "1 = 1" : "1 = 0", params: [] };
   }
 
-  const fragments = expected.map((value) => compileEquality(path, value));
+  const fragments = expected.map((value) =>
+    compileEquality(path, value, documentSql),
+  );
   const sql = fragments.map((fragment) => `(${fragment.sql})`).join(" OR ");
   const params = fragments.flatMap((fragment) => fragment.params);
 
@@ -774,17 +911,17 @@ function compileIn(path, expected, negate) {
   };
 }
 
-function compileExists(path, expected) {
+function compileExists(path, expected, documentSql) {
   const jsonPath = toJsonPath(path);
   const operator = Boolean(expected) ? "IS NOT" : "IS";
 
   return {
-    sql: `json_type(document, ?) ${operator} NULL`,
+    sql: `json_type(${documentSql}, ?) ${operator} NULL`,
     params: [jsonPath],
   };
 }
 
-function compileRegex(path, expected, options = "") {
+function compileRegex(path, expected, options = "", documentSql) {
   const jsonPath = toJsonPath(path);
   let pattern = expected;
   let flags = options;
@@ -803,12 +940,12 @@ function compileRegex(path, expected, options = "") {
   }
 
   return {
-    sql: `(json_type(document, ?) = 'text' AND regexp(?, json_extract(document, ?), ?) = 1)`,
+    sql: `(json_type(${documentSql}, ?) = 'text' AND regexp(?, json_extract(${documentSql}, ?), ?) = 1)`,
     params: [jsonPath, pattern, jsonPath, flags],
   };
 }
 
-function compileArrayContains(jsonPath, expected) {
+function compileArrayContains(jsonPath, expected, documentSql) {
   const alias = "item";
   const comparison = compileJsonValueComparison(
     `${alias}.value`,
@@ -818,7 +955,7 @@ function compileArrayContains(jsonPath, expected) {
   );
 
   return {
-    sql: `(json_type(document, ?) = 'array' AND EXISTS (SELECT 1 FROM json_each(document, ?) AS ${alias} WHERE ${comparison.sql}))`,
+    sql: `(json_type(${documentSql}, ?) = 'array' AND EXISTS (SELECT 1 FROM json_each(${documentSql}, ?) AS ${alias} WHERE ${comparison.sql}))`,
     params: [jsonPath, jsonPath, ...comparison.params],
   };
 }
@@ -869,7 +1006,7 @@ function fieldParamsFor(sql) {
   return (sql.match(/\?/g) ?? []).length;
 }
 
-function compileSort(sort) {
+function compileSort(sort, documentSql = "document") {
   assertPlainObject(sort, "sort");
 
   const clauses = [];
@@ -877,7 +1014,7 @@ function compileSort(sort) {
 
   for (const [path, direction] of Object.entries(sort)) {
     const normalizedDirection = normalizeSortDirection(direction);
-    clauses.push(`json_extract(document, ?) ${normalizedDirection}`);
+    clauses.push(`json_extract(${documentSql}, ?) ${normalizedDirection}`);
     params.push(toJsonPath(path));
   }
 

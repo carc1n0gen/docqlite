@@ -21,7 +21,9 @@ const Characters = db.collection("characters");
 Characters.insertOne({
   name: "SpongeBob SquarePants",
   job: "fry cook",
-  tags: ["krusty-krab", "jellyfisher"],
+  jellyfishCaught: 42,
+  hobbies: ["jellyfishing"],
+  address: { city: "Bikini Bottom", street: "124 Conch Street" },
 });
 
 const fryCooks = Characters.find({ job: "fry cook" });
@@ -36,7 +38,10 @@ db.close();
 ```js
 const result = Characters.insertOne({
   name: "Patrick Star",
-  home: "under a rock",
+  job: "professional best friend",
+  jellyfishCaught: 15,
+  hobbies: ["jellyfishing", "napping"],
+  address: { city: "Bikini Bottom", street: "120 Conch Street" },
 });
 
 console.log(result.insertedId);
@@ -44,12 +49,17 @@ console.log(result.insertedId);
 
 If a document does not include `_id`, DocQLite generates a 24-character time-sortable hex string inspired by MongoDB ObjectId. The generated value is stored as a plain string.
 
-You may also provide a custom MongoDB-style `_id` value, such as a string, number, boolean, `null`, or object:
+You may also provide a custom `_id` value, such as a string, number, boolean, `null`, and even object:
 
 ```js
 Characters.insertOne({
-  _id: "spongebob",
-  name: "SpongeBob SquarePants",
+  _id: "squidward-tentacles",
+  name: "Squidward Tentacles",
+  job: "cashier",
+  jellyfishCaught: 0,
+  hobbies: ["playing clarinet", "painting"],
+  badges: [],
+  address: { city: "Bikini Bottom", street: "122 Conch Street" },
 });
 ```
 
@@ -59,32 +69,30 @@ Custom `_id` values cannot be arrays, regular expressions, `undefined`, function
 Characters.insertMany([
   {
     name: "SpongeBob SquarePants",
-    email: "spongebob@krustykrab.example",
     job: "fry cook",
-    location: "Krusty Krab",
-    onShift: true,
     jellyfishCaught: 42,
-    krabbyPattiesMade: 100,
-    tags: ["krusty-krab", "jellyfisher"],
-    address: { city: "Bikini Bottom" },
+    krabbyPattiesMade: 1000,
+    hobbies: ["jellyfishing"],
+    badges: [],
+    address: { city: "Bikini Bottom", street: "124 Conch Street" },
   },
   {
     name: "Patrick Star",
     job: "professional best friend",
-    location: "Bikini Bottom",
-    onShift: false,
-    jellyfishCaught: 5,
-    tags: ["jellyfisher"],
-    address: { city: "Bikini Bottom" },
+    jellyfishCaught: 15,
+    krabbyPattiesMade: 0,
+    hobbies: ["jellyfishing", "napping"],
+    badges: ["best-friend"],
+    address: { city: "Bikini Bottom", street: "120 Conch Street" },
   },
   {
     name: "Squidward Tentacles",
     job: "cashier",
-    location: "Krusty Krab",
-    onShift: true,
     jellyfishCaught: 0,
-    tags: ["krusty-krab", "happy"],
-    address: { city: "Bikini Bottom" },
+    krabbyPattiesMade: 9,
+    hobbies: ["playing clarinet", "painting"],
+    badges: ["clarinetist-master", "optimist"],
+    address: { city: "Bikini Bottom", street: "122 Conch Street" },
   },
 ]);
 ```
@@ -115,7 +123,7 @@ Logical operators:
 
 ```js
 Characters.find({
-  $and: [{ jellyfishCaught: { $gte: 30 } }, { tags: "jellyfisher" }],
+  $and: [{ jellyfishCaught: { $gte: 30 } }, { hobbies: "jellyfishing" }],
 });
 ```
 
@@ -123,7 +131,7 @@ Sorting and pagination:
 
 ```js
 Characters.find(
-  { onShift: true },
+  { hobbies: "jellyfishing" },
   {
     sort: { jellyfishCaught: -1 },
     limit: 10,
@@ -141,7 +149,9 @@ const character = Characters.findOne({ name: "SpongeBob SquarePants" });
 Count documents:
 
 ```js
-const onShiftCharacters = Characters.countDocuments({ onShift: true });
+const expertJellyfishers = Characters.countDocuments({
+  jellyfishCaught: { $gte: 30 },
+});
 ```
 
 Supported query operators:
@@ -162,13 +172,85 @@ $or
 $nor
 ```
 
+## Look up related documents
+
+`lookup()` joins documents from another collection in the same database, similar to MongoDB's `$lookup` stage. The first argument filters the documents in the current collection. The second argument describes the join:
+
+```js
+const Pets = db.collection("pets");
+
+Pets.insertMany([
+  { name: "Gary", species: "sea snail", ownerName: "SpongeBob SquarePants" },
+  { name: "Rocky", species: "rock", ownerName: "Patrick Star" },
+  { name: "Snellie", species: "sea snail", ownerName: "Squidward Tentacles" },
+]);
+
+const charactersWithPets = Characters.lookup(
+  { "address.city": "Bikini Bottom" },
+  {
+    from: Pets,
+    localField: "name",
+    foreignField: "ownerName",
+    as: "pets",
+  },
+);
+
+console.log(charactersWithPets);
+
+// [
+//   {
+//     name: "SpongeBob SquarePants",
+//     ...
+//     _id: "...",
+//     pets: [
+//       { name: "Gary", species: "sea snail", ownerName: "SpongeBob SquarePants", _id: "..." },
+//     ],
+//   },
+//   ...
+// ]
+```
+
+Lookup options:
+
+- `from`: the collection to join. It must come from the same database.
+- `localField`: the field path on documents in the current collection.
+- `foreignField`: the field path on documents in the `from` collection.
+- `as`: the field path where the array of matching documents is stored.
+
+All of these fields support dot paths:
+
+```js
+const Orders = db.collection("orders");
+
+Orders.insertMany([
+  { customer: { id: "patrick" }, item: "Krabby Patty" },
+  { customer: { id: "patrick" }, item: "Kelp Shake" },
+]);
+
+Characters.insertOne({ _id: "patrick", name: "Patrick Star" });
+
+const [patrick] = Characters.lookup(
+  { _id: "patrick" },
+  {
+    from: Orders,
+    localField: "_id",
+    foreignField: "customer.id",
+    as: "receipts.orders",
+  },
+);
+
+console.log(patrick.receipts.orders.length); // 2
+```
+
+Every matching document in the current collection is returned. If nothing in `from` matches, `as` is set to an empty array. Values are matched strictly by JSON type, so `1` does not match `"1"`. Array fields are also compared as whole values, not element by element.
+
 ## Update documents
 
 ```js
 Characters.updateOne(
   { name: "SpongeBob SquarePants" },
   {
-    $set: { onShift: true },
+    $set: { hasBoatLicense: false },
     $inc: { krabbyPattiesMade: 1 },
   },
 );
@@ -178,9 +260,9 @@ Update many documents:
 
 ```js
 Characters.updateMany(
-  { location: "Krusty Krab" },
+  { hobbies: "jellyfishing" },
   {
-    $addToSet: { tags: "krusty-krab" },
+    $addToSet: { badges: "jellyfishing-champion" },
   },
 );
 ```
@@ -191,14 +273,14 @@ Array updates:
 Characters.updateOne(
   { name: "SpongeBob SquarePants" },
   {
-    $push: { tags: "bubble-blower" },
+    $push: { hobbies: "blowing bubbles" },
   },
 );
 
 Characters.updateOne(
   { name: "Squidward Tentacles" },
   {
-    $pull: { tags: "happy" },
+    $pull: { badges: "optimist" },
   },
 );
 ```
@@ -207,9 +289,9 @@ Upsert:
 
 ```js
 Characters.updateOne(
-  { email: "spongebob@krustykrab.example" },
+  { name: "Sandy Cheeks" },
   {
-    $set: { name: "SpongeBob SquarePants", onShift: true },
+    $set: { name: "Sandy Cheeks" },
     $setOnInsert: { createdAt: new Date().toISOString() },
   },
   { upsert: true },

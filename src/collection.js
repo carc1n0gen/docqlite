@@ -17,6 +17,18 @@ export class Collection {
     this.#createTable();
   }
 
+  createIndex(keys, options = {}) {
+    assertPlainObject(options, "createIndex options");
+
+    const index = compileCreateIndexSql(this, keys, options);
+
+    if (index.sql) {
+      this.database.exec(index.sql);
+    }
+
+    return index.name;
+  }
+
   insertOne(document) {
     const record = prepareDocument(document);
     const statement = this.database.prepare(
@@ -62,11 +74,16 @@ export class Collection {
     assertPlainObject(query, "find query");
     assertPlainObject(options, "find options");
 
-    const sqlQuery = compileSelectSql(this.tableName, query, options);
+    const lookup =
+      options.lookup === undefined
+        ? null
+        : normalizeLookup(options.lookup, this);
+    const sqlQuery = compileFindSql(this, query, options, lookup);
+
     return this.database
       .prepare(sqlQuery.sql)
       .all(...sqlQuery.params)
-      .map((row) => JSON.parse(row.document));
+      .map((row) => hydrateDocument(row, lookup));
   }
 
   findOne(query = {}, options = {}) {
@@ -219,13 +236,122 @@ export class Collection {
   }
 }
 
+function compileFindSql(collection, query, options, lookup) {
+  if (!lookup) {
+    return compileSelectSql(collection.tableName, query, options);
+  }
+
+  const sourceAlias = "__docqlite_source";
+  const documentSql = `${sourceAlias}.document`;
+  const idSql = `${sourceAlias}._id`;
+  const lookupSql = compileLookupSql(lookup, documentSql, idSql);
+
+  return compileSelectSql(
+    `${collection.tableName} AS ${sourceAlias}`,
+    query,
+    options,
+    `${documentSql} AS document, ${lookupSql} AS __docqlite_lookup`,
+    documentSql,
+    idSql,
+  );
+}
+
+function compileCreateIndexSql(collection, keys, options) {
+  const fields = normalizeIndexKeys(keys);
+
+  if (options.name !== undefined) {
+    normalizeIndexName(options.name);
+  }
+
+  if (options.unique !== undefined && typeof options.unique !== "boolean") {
+    throw new TypeError("createIndex unique option must be a boolean");
+  }
+
+  if (fields.length === 1 && isIdPath(fields[0].path)) {
+    return { name: "_id_", sql: null };
+  }
+
+  const name = options.name ?? defaultIndexName(collection.name, fields);
+  const unique = options.unique ? "UNIQUE " : "";
+  const expressions = fields.map(({ path, direction }) => {
+    if (isIdPath(path)) {
+      return `_id ${direction}`;
+    }
+
+    return `json_extract(document, ${toJsonPathSql(path)}) ${direction}`;
+  });
+
+  return {
+    name,
+    sql: `CREATE ${unique}INDEX IF NOT EXISTS ${quoteIdentifier(name)} ON ${collection.tableName} (${expressions.join(", ")})`,
+  };
+}
+
+function normalizeIndexKeys(keys) {
+  if (typeof keys === "string") {
+    assertIndexFieldPath(keys);
+    return [{ path: keys, direction: "ASC" }];
+  }
+
+  assertPlainObject(keys, "createIndex keys");
+
+  const entries = Object.entries(keys);
+
+  if (entries.length === 0) {
+    throw new TypeError("createIndex keys must include at least one field");
+  }
+
+  return entries.map(([path, direction]) => {
+    assertIndexFieldPath(path);
+
+    return {
+      path,
+      direction: normalizeSortDirection(direction),
+    };
+  });
+}
+
+function assertIndexFieldPath(path) {
+  assertFieldPath(path);
+
+  if (path.startsWith("$")) {
+    throw new TypeError("createIndex field paths cannot start with $");
+  }
+}
+
+function normalizeIndexName(name) {
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new TypeError("createIndex name option must be a non-empty string");
+  }
+
+  return name;
+}
+
+function defaultIndexName(collectionName, fields) {
+  return `${sanitizeIndexNamePart(collectionName)}_${fields
+    .map(
+      ({ path, direction }) =>
+        `${sanitizeIndexNamePart(path)}_${direction.toLowerCase()}`,
+    )
+    .join("_")}_idx`;
+}
+
+function sanitizeIndexNamePart(value) {
+  return (
+    value.replaceAll(/[^A-Za-z0-9]+/g, "_").replaceAll(/^_+|_+$/g, "") ||
+    "field"
+  );
+}
+
 function compileSelectSql(
   tableName,
   query,
   options = {},
   columns = "document",
+  documentSql = "document",
+  idSql = "_id",
 ) {
-  const compiledQuery = compileQuery(query);
+  const compiledQuery = compileQuery(query, documentSql, idSql);
   let sql = `SELECT ${columns} FROM ${tableName}`;
   const params = [...compiledQuery.params];
 
@@ -234,7 +360,7 @@ function compileSelectSql(
   }
 
   if (options.sort) {
-    const compiledSort = compileSort(options.sort);
+    const compiledSort = compileSort(options.sort, documentSql);
     sql += ` ORDER BY ${compiledSort.sql}`;
     params.push(...compiledSort.params);
   }
@@ -254,6 +380,168 @@ function compileSelectSql(
   }
 
   return { sql, params };
+}
+
+function normalizeLookup(lookup, collection) {
+  assertPlainObject(lookup, "lookup");
+
+  if (!(lookup.from instanceof Collection)) {
+    throw new TypeError("lookup.from must be a DocQLite collection");
+  }
+
+  if (lookup.from.database !== collection.database) {
+    throw new TypeError("lookup.from must use the same database connection");
+  }
+
+  if (
+    Object.hasOwn(lookup, "foreignField") &&
+    Object.hasOwn(lookup, "foreinField")
+  ) {
+    throw new TypeError(
+      "lookup cannot include both foreignField and foreinField",
+    );
+  }
+
+  const foreignField = lookup.foreignField ?? lookup.foreinField;
+
+  assertLookupField(lookup.localField, "lookup.localField");
+  assertLookupField(foreignField, "lookup.foreignField");
+  assertLookupField(lookup.as, "lookup.as");
+
+  if (lookup.justOne !== undefined && typeof lookup.justOne !== "boolean") {
+    throw new TypeError("lookup.justOne must be a boolean");
+  }
+
+  return {
+    from: lookup.from,
+    localField: lookup.localField,
+    foreignField,
+    as: lookup.as,
+    justOne: lookup.justOne === true,
+  };
+}
+
+function assertLookupField(value, label) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError(`${label} must be a non-empty string`);
+  }
+}
+
+function compileLookupSql(lookup, sourceDocumentSql, sourceIdSql) {
+  const lookupAlias = "__docqlite_lookup";
+  const lookupDocumentSql = `${lookupAlias}.document`;
+  const lookupIdSql = `${lookupAlias}._id`;
+  const fieldEquality = compileFieldReferenceEquality(
+    sourceDocumentSql,
+    sourceIdSql,
+    lookup.localField,
+    lookupDocumentSql,
+    lookupIdSql,
+    lookup.foreignField,
+  );
+
+  if (lookup.justOne) {
+    return `(
+      SELECT ${lookupDocumentSql}
+      FROM ${lookup.from.tableName} AS ${lookupAlias}
+      WHERE ${fieldEquality.sql}
+      LIMIT 1
+    )`;
+  }
+
+  return `(
+    SELECT COALESCE(json_group_array(json(${lookupDocumentSql})), json('[]'))
+    FROM ${lookup.from.tableName} AS ${lookupAlias}
+    WHERE ${fieldEquality.sql}
+  )`;
+}
+
+function compileFieldReferenceEquality(
+  leftDocumentSql,
+  leftIdSql,
+  leftPath,
+  rightDocumentSql,
+  rightIdSql,
+  rightPath,
+) {
+  if (isIdPath(rightPath)) {
+    const leftValue = compileEncodedFieldReference(
+      leftDocumentSql,
+      leftIdSql,
+      leftPath,
+    );
+
+    return {
+      sql: `(${leftValue.existsSql} AND ${rightIdSql} = ${leftValue.sql})`,
+      params: [],
+    };
+  }
+
+  return compileJsonFieldReferenceEquality(
+    leftDocumentSql,
+    leftPath,
+    rightDocumentSql,
+    rightPath,
+  );
+}
+
+function compileJsonFieldReferenceEquality(
+  leftDocumentSql,
+  leftPath,
+  rightDocumentSql,
+  rightPath,
+) {
+  const leftPathSql = toJsonPathSql(leftPath);
+  const rightPathSql = toJsonPathSql(rightPath);
+  const leftType = `json_type(${leftDocumentSql}, ${leftPathSql})`;
+  const rightType = `json_type(${rightDocumentSql}, ${rightPathSql})`;
+  const leftValue = `json_extract(${leftDocumentSql}, ${leftPathSql})`;
+  const rightValue = `json_extract(${rightDocumentSql}, ${rightPathSql})`;
+
+  return {
+    sql: `(${leftType} IS NOT NULL AND ${rightType} IS NOT NULL AND ${rightValue} IS ${leftValue} AND (${rightType} = ${leftType} OR (${rightType} IN ('integer', 'real') AND ${leftType} IN ('integer', 'real'))))`,
+    params: [],
+  };
+}
+
+function compileEncodedFieldReference(documentSql, idSql, path) {
+  if (isIdPath(path)) {
+    return { sql: idSql, existsSql: `${idSql} IS NOT NULL` };
+  }
+
+  const pathSql = toJsonPathSql(path);
+  const typeSql = `json_type(${documentSql}, ${pathSql})`;
+  const valueSql = `json_extract(${documentSql}, ${pathSql})`;
+
+  return {
+    sql: `(CASE ${typeSql}
+      WHEN 'null' THEN 'null:null'
+      WHEN 'text' THEN 'string:' || ${valueSql}
+      WHEN 'integer' THEN 'number:' || ${valueSql}
+      WHEN 'real' THEN 'number:' || ${valueSql}
+      WHEN 'true' THEN 'boolean:true'
+      WHEN 'false' THEN 'boolean:false'
+      WHEN 'object' THEN 'json:' || json(${valueSql})
+      WHEN 'array' THEN 'json:' || json(${valueSql})
+    END)`,
+    existsSql: `${typeSql} IS NOT NULL`,
+  };
+}
+
+function hydrateDocument(row, lookup) {
+  const document = JSON.parse(row.document);
+
+  if (!lookup) {
+    return document;
+  }
+
+  document[lookup.as] = lookup.justOne
+    ? row.__docqlite_lookup === null
+      ? null
+      : JSON.parse(row.__docqlite_lookup)
+    : JSON.parse(row.__docqlite_lookup ?? "[]");
+
+  return document;
 }
 
 function assertUpdateDocument(update) {
@@ -629,14 +917,14 @@ function deepEqual(left, right) {
   return false;
 }
 
-function compileQuery(query) {
+function compileQuery(query, documentSql = "document", idSql = "_id") {
   assertPlainObject(query, "query");
 
   const fragments = [];
   const params = [];
 
   for (const [key, condition] of Object.entries(query)) {
-    const fragment = compileQueryEntry(key, condition);
+    const fragment = compileQueryEntry(key, condition, documentSql, idSql);
     fragments.push(fragment.sql);
     params.push(...fragment.params);
   }
@@ -647,34 +935,64 @@ function compileQuery(query) {
   };
 }
 
-function compileQueryEntry(key, condition) {
+function compileQueryEntry(key, condition, documentSql, idSql) {
   if (key === "$and") {
-    return compileLogicalQuery("$and", condition, "AND", false);
+    return compileLogicalQuery(
+      "$and",
+      condition,
+      "AND",
+      false,
+      documentSql,
+      idSql,
+    );
   }
 
   if (key === "$or") {
-    return compileLogicalQuery("$or", condition, "OR", false);
+    return compileLogicalQuery(
+      "$or",
+      condition,
+      "OR",
+      false,
+      documentSql,
+      idSql,
+    );
   }
 
   if (key === "$nor") {
-    return compileLogicalQuery("$nor", condition, "OR", true);
+    return compileLogicalQuery(
+      "$nor",
+      condition,
+      "OR",
+      true,
+      documentSql,
+      idSql,
+    );
   }
 
   if (key.startsWith("$")) {
     throw new Error(`Unsupported query operator: ${key}`);
   }
 
-  return compileFieldCondition(key, condition);
+  return compileFieldCondition(key, condition, documentSql, idSql);
 }
 
-function compileLogicalQuery(operator, condition, joiner, negate) {
+function compileLogicalQuery(
+  operator,
+  condition,
+  joiner,
+  negate,
+  documentSql,
+  idSql,
+) {
   assertQueryArray(condition, operator);
 
   if (condition.length === 0) {
     return { sql: negate ? "1 = 1" : "1 = 0", params: [] };
   }
 
-  const fragments = condition.map((childQuery) => compileQuery(childQuery));
+  const fragments = condition.map((childQuery) =>
+    compileQuery(childQuery, documentSql, idSql),
+  );
   const sql = fragments
     .map((fragment) => `(${fragment.sql || "1 = 1"})`)
     .join(` ${joiner} `);
@@ -686,9 +1004,9 @@ function compileLogicalQuery(operator, condition, joiner, negate) {
   };
 }
 
-function compileFieldCondition(path, condition) {
+function compileFieldCondition(path, condition, documentSql, idSql) {
   if (!isOperatorObject(condition)) {
-    return compileEquality(path, condition);
+    return compileEquality(path, condition, documentSql, idSql);
   }
 
   const fragments = [];
@@ -699,7 +1017,14 @@ function compileFieldCondition(path, condition) {
       continue;
     }
 
-    const fragment = compileFieldOperator(path, operator, expected, condition);
+    const fragment = compileFieldOperator(
+      path,
+      operator,
+      expected,
+      condition,
+      documentSql,
+      idSql,
+    );
     fragments.push(fragment.sql);
     params.push(...fragment.params);
   }
@@ -714,46 +1039,73 @@ function compileFieldCondition(path, condition) {
   };
 }
 
-function compileFieldOperator(path, operator, expected, condition) {
+function compileFieldOperator(
+  path,
+  operator,
+  expected,
+  condition,
+  documentSql,
+  idSql,
+) {
   switch (operator) {
     case "$eq":
-      return compileEquality(path, expected);
+      return compileEquality(path, expected, documentSql, idSql);
     case "$ne": {
-      const equality = compileEquality(path, expected);
+      const equality = compileEquality(path, expected, documentSql, idSql);
       return {
         sql: `NOT (${equality.sql})`,
         params: equality.params,
       };
     }
     case "$gt":
-      return compileComparison(path, ">", expected);
+      return compileComparison(path, ">", expected, documentSql);
     case "$gte":
-      return compileComparison(path, ">=", expected);
+      return compileComparison(path, ">=", expected, documentSql);
     case "$lt":
-      return compileComparison(path, "<", expected);
+      return compileComparison(path, "<", expected, documentSql);
     case "$lte":
-      return compileComparison(path, "<=", expected);
+      return compileComparison(path, "<=", expected, documentSql);
     case "$in":
-      return compileIn(path, expected, false);
+      return compileIn(path, expected, false, documentSql, idSql);
     case "$nin":
-      return compileIn(path, expected, true);
+      return compileIn(path, expected, true, documentSql, idSql);
     case "$exists":
-      return compileExists(path, expected);
+      return compileExists(path, expected, documentSql);
     case "$regex":
-      return compileRegex(path, expected, condition.$options);
+      return compileRegex(path, expected, condition.$options, documentSql);
     default:
       throw new Error(`Unsupported query operator: ${operator}`);
   }
 }
 
-function compileEquality(path, expected) {
+function compileIdEquality(expected, idSql) {
+  return {
+    sql: `${idSql} = ?`,
+    params: [encodeQueryId(expected)],
+  };
+}
+
+function compileIdIn(expected, negate, idSql) {
+  const placeholders = expected.map(() => "?").join(", ");
+
+  return {
+    sql: `${idSql} ${negate ? "NOT IN" : "IN"} (${placeholders})`,
+    params: expected.map(encodeQueryId),
+  };
+}
+
+function compileEquality(path, expected, documentSql, idSql) {
+  if (isIdPath(path)) {
+    return compileIdEquality(expected, idSql);
+  }
+
   assertJsonComparable(expected, "equality value");
 
-  const jsonPath = toJsonPath(path);
+  const jsonPathSql = toJsonPathSql(path);
   const exact = compileJsonValueComparison(
-    "json_extract(document, ?)",
-    "json_type(document, ?)",
-    [jsonPath, jsonPath],
+    `json_extract(${documentSql}, ${jsonPathSql})`,
+    `json_type(${documentSql}, ${jsonPathSql})`,
+    [],
     expected,
   );
 
@@ -761,7 +1113,7 @@ function compileEquality(path, expected) {
     return exact;
   }
 
-  const contains = compileArrayContains(jsonPath, expected);
+  const contains = compileArrayContains(documentSql, jsonPathSql, expected);
 
   return {
     sql: `((${exact.sql}) OR (${contains.sql}))`,
@@ -769,22 +1121,22 @@ function compileEquality(path, expected) {
   };
 }
 
-function compileComparison(path, operator, expected) {
+function compileComparison(path, operator, expected, documentSql) {
   if (!isComparableScalar(expected)) {
     throw new TypeError(
       `${operator} expects a string, number, boolean, or null`,
     );
   }
 
-  const jsonPath = toJsonPath(path);
+  const jsonPathSql = toJsonPathSql(path);
 
   return {
-    sql: `(json_type(document, ?) IS NOT NULL AND json_extract(document, ?) ${operator} ?)`,
-    params: [jsonPath, jsonPath, expected],
+    sql: `(json_type(${documentSql}, ${jsonPathSql}) IS NOT NULL AND json_extract(${documentSql}, ${jsonPathSql}) ${operator} ?)`,
+    params: [expected],
   };
 }
 
-function compileIn(path, expected, negate) {
+function compileIn(path, expected, negate, documentSql, idSql) {
   if (!Array.isArray(expected)) {
     throw new TypeError(`${negate ? "$nin" : "$in"} expects an array`);
   }
@@ -793,7 +1145,13 @@ function compileIn(path, expected, negate) {
     return { sql: negate ? "1 = 1" : "1 = 0", params: [] };
   }
 
-  const fragments = expected.map((value) => compileEquality(path, value));
+  if (isIdPath(path)) {
+    return compileIdIn(expected, negate, idSql);
+  }
+
+  const fragments = expected.map((value) =>
+    compileEquality(path, value, documentSql, idSql),
+  );
   const sql = fragments.map((fragment) => `(${fragment.sql})`).join(" OR ");
   const params = fragments.flatMap((fragment) => fragment.params);
 
@@ -803,18 +1161,18 @@ function compileIn(path, expected, negate) {
   };
 }
 
-function compileExists(path, expected) {
-  const jsonPath = toJsonPath(path);
+function compileExists(path, expected, documentSql) {
+  const jsonPathSql = toJsonPathSql(path);
   const operator = Boolean(expected) ? "IS NOT" : "IS";
 
   return {
-    sql: `json_type(document, ?) ${operator} NULL`,
-    params: [jsonPath],
+    sql: `json_type(${documentSql}, ${jsonPathSql}) ${operator} NULL`,
+    params: [],
   };
 }
 
-function compileRegex(path, expected, options = "") {
-  const jsonPath = toJsonPath(path);
+function compileRegex(path, expected, options = "", documentSql) {
+  const jsonPathSql = toJsonPathSql(path);
   let pattern = expected;
   let flags = options;
 
@@ -832,12 +1190,12 @@ function compileRegex(path, expected, options = "") {
   }
 
   return {
-    sql: `(json_type(document, ?) = 'text' AND regexp(?, json_extract(document, ?), ?) = 1)`,
-    params: [jsonPath, pattern, jsonPath, flags],
+    sql: `(json_type(${documentSql}, ${jsonPathSql}) = 'text' AND regexp(?, json_extract(${documentSql}, ${jsonPathSql}), ?) = 1)`,
+    params: [pattern, flags],
   };
 }
 
-function compileArrayContains(jsonPath, expected) {
+function compileArrayContains(documentSql, jsonPathSql, expected) {
   const alias = "item";
   const comparison = compileJsonValueComparison(
     `${alias}.value`,
@@ -847,8 +1205,8 @@ function compileArrayContains(jsonPath, expected) {
   );
 
   return {
-    sql: `(json_type(document, ?) = 'array' AND EXISTS (SELECT 1 FROM json_each(document, ?) AS ${alias} WHERE ${comparison.sql}))`,
-    params: [jsonPath, jsonPath, ...comparison.params],
+    sql: `(json_type(${documentSql}, ${jsonPathSql}) = 'array' AND EXISTS (SELECT 1 FROM json_each(${documentSql}, ${jsonPathSql}) AS ${alias} WHERE ${comparison.sql}))`,
+    params: [...comparison.params],
   };
 }
 
@@ -898,7 +1256,7 @@ function fieldParamsFor(sql) {
   return (sql.match(/\?/g) ?? []).length;
 }
 
-function compileSort(sort) {
+function compileSort(sort, documentSql = "document") {
   assertPlainObject(sort, "sort");
 
   const clauses = [];
@@ -906,8 +1264,9 @@ function compileSort(sort) {
 
   for (const [path, direction] of Object.entries(sort)) {
     const normalizedDirection = normalizeSortDirection(direction);
-    clauses.push(`json_extract(document, ?) ${normalizedDirection}`);
-    params.push(toJsonPath(path));
+    clauses.push(
+      `json_extract(${documentSql}, ${toJsonPathSql(path)}) ${normalizedDirection}`,
+    );
   }
 
   if (clauses.length === 0) {
@@ -930,6 +1289,10 @@ function normalizeSortDirection(direction) {
   }
 
   throw new TypeError("sort direction must be 1, -1, 'asc', or 'desc'");
+}
+
+function toJsonPathSql(path) {
+  return quoteSqlString(toJsonPath(path));
 }
 
 function toJsonPath(path) {
@@ -1009,6 +1372,11 @@ function cloneJson(value) {
   return JSON.parse(json);
 }
 
+function encodeQueryId(value) {
+  assertValidId(value);
+  return encodeId(cloneJson(value));
+}
+
 function encodeId(value) {
   if (value === null) {
     return "null:null";
@@ -1029,8 +1397,16 @@ function encodeId(value) {
   return `json:${JSON.stringify(value)}`;
 }
 
+function isIdPath(path) {
+  return path === "_id";
+}
+
 function quoteIdentifier(identifier) {
   return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function quoteSqlString(value) {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function assertPlainObject(value, label) {

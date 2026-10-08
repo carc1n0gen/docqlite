@@ -140,6 +140,129 @@ test("queries with equality, nested paths, operators, sorting, and limits", () =
   db.close();
 });
 
+test("looks up related documents for find and findOne", () => {
+  const db = docqlite(":memory:");
+  const characters = db.collection("characters");
+  const orders = db.collection("orders");
+
+  const results = characters.insertMany([spongebob, patrick, squidward]);
+  orders.insertMany([
+    { item: "Krabby Patty", customerId: results.insertedIds[0] },
+    { item: "Kelp Shake", customerId: results.insertedIds[0] },
+    { item: "Coral Bits", customerId: results.insertedIds[1] },
+    { item: "Invisible Boatmobile Wax", customerId: "unknown" },
+  ]);
+
+  assert.equal(
+    orders.createIndex({ customerId: 1 }, { name: "orders_customer_id_idx" }),
+    "orders_customer_id_idx",
+  );
+  const spongebobWithOrders = characters.findOne(
+    { _id: results.insertedIds[0] },
+    {
+      lookup: {
+        from: orders,
+        localField: "_id",
+        foreignField: "customerId",
+        as: "orders",
+      },
+    },
+  );
+
+  assert.deepEqual(spongebobWithOrders.orders.map(({ item }) => item).sort(), [
+    "Kelp Shake",
+    "Krabby Patty",
+  ]);
+
+  const charactersWithOrders = characters.find(
+    {},
+    {
+      sort: { name: 1 },
+      lookup: {
+        from: orders,
+        localField: "_id",
+        foreignField: "customerId",
+        as: "orders",
+      },
+    },
+  );
+
+  assert.deepEqual(
+    charactersWithOrders.map((character) => [
+      character.name,
+      character.orders.map(({ item }) => item).sort(),
+    ]),
+    [
+      [patrick.name, ["Coral Bits"]],
+      [spongebob.name, ["Kelp Shake", "Krabby Patty"]],
+      [squidward.name, []],
+    ],
+  );
+
+  const ordersWithCustomers = orders.find(
+    {},
+    {
+      sort: { item: 1 },
+      lookup: {
+        from: characters,
+        localField: "customerId",
+        foreignField: "_id",
+        justOne: true,
+        as: "customer",
+      },
+    },
+  );
+
+  assert.deepEqual(
+    ordersWithCustomers.map((order) => [
+      order.item,
+      order.customer?.name ?? null,
+    ]),
+    [
+      ["Coral Bits", patrick.name],
+      ["Invisible Boatmobile Wax", null],
+      ["Kelp Shake", spongebob.name],
+      ["Krabby Patty", spongebob.name],
+    ],
+  );
+
+  db.close();
+});
+
+test("creates indexes for document fields", () => {
+  const db = docqlite(":memory:");
+  const characters = db.collection("characters");
+
+  const indexName = characters.createIndex(
+    { "address.city": 1, jellyfishCaught: -1 },
+    { name: "characters_city_jellyfish_idx" },
+  );
+
+  assert.equal(indexName, "characters_city_jellyfish_idx");
+
+  const index = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+    .get(indexName);
+
+  assert.match(
+    index.sql,
+    /json_extract\(document, '\$\."address"\."city"'\) ASC/,
+  );
+  assert.match(
+    index.sql,
+    /json_extract\(document, '\$\."jellyfishCaught"'\) DESC/,
+  );
+
+  assert.equal(
+    characters.createIndex({ name: 1 }, { unique: true }),
+    "characters_name_asc_idx",
+  );
+  assert.equal(characters.createIndex({ _id: 1 }), "_id_");
+  assert.throws(() => characters.createIndex({}), /at least one field/);
+
+  db.close();
+});
+
 test("updates one matching document with Mongo-like operators", () => {
   const db = docqlite(":memory:");
   const characters = db.collection("characters");
@@ -272,6 +395,14 @@ test("allows custom _id values while keeping _id immutable", () => {
       character.name,
     );
   }
+
+  assert.deepEqual(
+    characters
+      .find({ _id: { $in: [results.insertedIds[0], results.insertedIds[4]] } })
+      .map(({ name }) => name)
+      .sort(),
+    [customIdCharacters[0].name, customIdCharacters[4].name].sort(),
+  );
 
   assert.throws(
     () =>

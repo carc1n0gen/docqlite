@@ -1,6 +1,6 @@
 # DocQLite
 
-DocQLite is a small document store for Node.js with a MongoDB like API, and uses SQLite under the hood for storage. It is synchronous and dependency-free, as it uses the built-in [`node:sqlite`](https://nodejs.org/api/sqlite.html) module.
+DocQLite is a small document store for Node.js. It stores JSON documents in SQLite and provides a MongoDB-like collection API for common insert, query, update, and delete operations. It is has zero dependencies as it uses the built in `node:sqlite` module.
 
 ## Installation
 

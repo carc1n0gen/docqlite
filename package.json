@@ -1,7 +1,19 @@
 {
   "name": "docqlite",
   "version": "1.2.0",
-  "description": "SQLite3 wrapper with a MongoDB-like document API",
+  "description": "DocQLite is a small document store for Node.js. It stores JSON documents in SQLite and provides a MongoDB-like collection API for common insert, query, update, and delete operations. It is has zero dependencies as it uses the built in node:sqlite module.",
+  "keywords": [
+    "sqlite",
+    "sqlite3",
+    "node:sqlite",
+    "document-store",
+    "nosql",
+    "mongodb",
+    "mongo-like",
+    "json",
+    "embedded-database",
+    "local-database"
+  ],
   "license": "MIT",
   "author": "Carson Evans <carsonwevans@gmail.com>",
   "type": "module",
